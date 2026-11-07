@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { MenuShell } from "@/components/menu-shell";
@@ -38,12 +38,15 @@ const STORAGE_KEY = "lh:sidebar-open";
  * numbers compose: 640 + 288 sidebar = 928), so it auto-closes — and
  * auto-RESTORES when the window widens again (owner choice: the sidebar
  * pops back, not a manual re-open). The whole behavior is one expression:
- * rendered = pref && !narrow, where pref is the persisted user choice.
- * Manual closes persist and stay closed; auto-close does not touch the
- * preference. Opening the sidebar while narrow asks the Electron shell to
- * widen the window to the threshold (window.lh.expandWindow, IPC in
- * electron/main.cjs) — the resize listener flips `narrow` and the sidebar
- * appears. In the plain browser there is no window to widen and no
+ * rendered = pref && (!narrow || forced), where pref is the persisted
+ * user choice and forced is a session-only flag (below). Manual closes
+ * persist and stay closed; auto-close does not touch the preference.
+ * Opening the sidebar while narrow asks the Electron shell to widen the
+ * window to the threshold (window.lh.expandWindow, IPC in
+ * electron/main.cjs) — the resize listener flips `narrow` and the
+ * sidebar appears. If the shell cannot widen (tiled, snapped, maximized),
+ * `forced` keeps it visible until a manual close or the window is wide
+ * again. In the plain browser there is no window to widen and no
  * suppression — a narrow tab opens the sidebar if the user says so.
  *
  * Mirrors SIDEBAR_AUTOCLOSE in electron/main.cjs — keep in sync.
@@ -52,6 +55,68 @@ import type { ChatGPTControlBridge, NativeSubscriptionControlBridge } from "@/sr
 import type { UpdateState } from "@/components/settings/update-settings.tsx";
 import { FilePathDropZone } from "@/components/file-path-drop-zone";
 const SIDEBAR_AUTOCLOSE = 928;
+// Measured: openbox snaps back ~18ms after expandWindow; 500ms gives margin.
+const SETTLE_MS = 500;
+
+export type SidebarState = {
+	/** Stored preference. */
+	open: boolean;
+	/** Window is below SIDEBAR_AUTOCLOSE (Electron only). */
+	narrow: boolean;
+	/** User opened it while narrow; session-only. */
+	forced: boolean;
+	/** Effects for the provider to run after this transition. */
+	persist: "0" | "1" | null;
+	widen: boolean;
+};
+export type SidebarAction =
+	| { type: "toggle" }
+	| { type: "resize"; narrow: boolean }
+	| { type: "settled" }
+	| { type: "restore"; open: boolean };
+
+export const INITIAL_SIDEBAR_STATE: SidebarState = {
+	open: false,
+	narrow: false,
+	forced: false,
+	persist: null,
+	widen: false,
+};
+
+/** What the user sees: the preference, minus the narrow auto-close,
+ *  unless they opened it while narrow (`forced`). */
+export function sidebarVisible(s: Pick<SidebarState, "open" | "narrow" | "forced">) {
+	return s.open && (!s.narrow || s.forced);
+}
+
+/**
+ * Toggle decides from what is VISIBLE, not the stored preference, so a
+ * stored-open pref hidden by narrow opens on the first click. Opening
+ * while narrow also asks the shell to widen — which a tiled, snapped or
+ * maximized window may refuse, hence `forced`. `forced` ends on a manual
+ * close or once the window has STAYED wide ("settled"): a window manager
+ * that refuses the widen can still flash the wider size for a few ms
+ * before snapping back, so a bare resize to wide must not end it.
+ */
+export function sidebarReducer(s: SidebarState, action: SidebarAction): SidebarState {
+	switch (action.type) {
+		// No-op transitions return `s` itself so React bails out of the
+		// re-render (resize fires continuously during a window drag).
+		case "restore":
+			if (action.open === s.open && !s.persist && !s.widen) return s;
+			return { ...s, open: action.open, persist: null, widen: false };
+		case "resize":
+			if (action.narrow === s.narrow && !s.persist && !s.widen) return s;
+			return { ...s, narrow: action.narrow, persist: null, widen: false };
+		case "settled": // the window stayed wide: end the user's force
+			if (!(s.forced && !s.narrow) && !s.persist && !s.widen) return s;
+			return { ...s, forced: s.narrow && s.forced, persist: null, widen: false };
+		case "toggle":
+			if (sidebarVisible(s)) return { ...s, open: false, forced: false, persist: "0", widen: false };
+			if (s.narrow) return { ...s, open: true, forced: true, persist: "0", widen: true };
+			return { ...s, open: true, forced: false, persist: "1", widen: false };
+	}
+}
 
 // Module scope, guarded for SSR (the server has no navigator).
 const IS_ELECTRON = typeof navigator !== "undefined" && navigator.userAgent.includes("Electron");
@@ -105,8 +170,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 	}, []);
 	// Start closed so server and client first-render agree (no hydration
 	// mismatch); the stored value is applied after mount.
-	const [open, setOpen] = useState(false);
-	const [narrow, setNarrow] = useState(false);
+	const [state, dispatch] = useReducer(sidebarReducer, INITIAL_SIDEBAR_STATE);
 	const [mounted, setMounted] = useState(false);
 
 	useEffect(() => {
@@ -132,7 +196,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 
 		const stored = localStorage.getItem(STORAGE_KEY);
 		// Default: open (first run introduces the sidebar).
-		setOpen(stored === null ? true : stored === "1");
+		dispatch({ type: "restore", open: stored === null ? true : stored === "1" });
 		setMounted(true);
 		return () => off?.();
 	}, []);
@@ -143,29 +207,30 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 	// narrow window never flashes the open sidebar on load.
 	useEffect(() => {
 		if (!IS_ELECTRON) return; // plain-browser tabs open freely
-		const onResize = () => setNarrow(window.innerWidth < SIDEBAR_AUTOCLOSE);
+		let settle: ReturnType<typeof setTimeout> | undefined;
+		const onResize = () => {
+			const narrow = window.innerWidth < SIDEBAR_AUTOCLOSE;
+			dispatch({ type: "resize", narrow });
+			clearTimeout(settle);
+			if (!narrow) settle = setTimeout(() => dispatch({ type: "settled" }), SETTLE_MS);
+		};
 		onResize();
 		window.addEventListener("resize", onResize);
-		return () => window.removeEventListener("resize", onResize);
+		return () => {
+			clearTimeout(settle);
+			window.removeEventListener("resize", onResize);
+		};
 	}, []);
 
-	const toggle = useCallback(() => {
-		// Opening while narrow (auto-closed, or the user's own closed-at-
-		// narrow): ask the shell to widen to the threshold — the resize
-		// listener flips `narrow` and the sidebar appears. The preference
-		// persists like any other open, so a restart at a narrow width
-		// still auto-restores when widened.
-		if (narrow && !open) {
-			localStorage.setItem(STORAGE_KEY, "0");
-			setOpen(true);
-			window.lh?.expandWindow();
-			return;
-		}
-		setOpen((v) => {
-			localStorage.setItem(STORAGE_KEY, v ? "0" : "1");
-			return !v;
-		});
-	}, [narrow, open]);
+	// Side effects of a transition (reducer stays pure).
+	useEffect(() => {
+		if (state.persist) localStorage.setItem(STORAGE_KEY, state.persist);
+		if (state.widen) window.lh?.expandWindow();
+	}, [state]);
+
+	const toggle = useCallback(() => dispatch({ type: "toggle" }), []);
+	const visible = sidebarVisible(state);
+	const ctx = useMemo(() => ({ open: visible, toggle }), [visible, toggle]);
 
 	// ⌘B: the global shortcut dispatches kbdEventForAction("toggle-sidebar")
 	// and the context answers on exactly that name — the shared spelling
@@ -181,7 +246,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 	}, [toggle]);
 
 	return (
-		<SidebarContext.Provider value={{ open: open && !narrow, toggle }}>
+		<SidebarContext.Provider value={ctx}>
 			{/* transitions gated on mount: no slide-in flash on page load */}
 			<div className={cn("flex h-dvh", mounted && "[&_.sidebar-motion]:transition-[width,margin,opacity]")}>{children}</div>
 		</SidebarContext.Provider>
